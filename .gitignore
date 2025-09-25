@@ -1,0 +1,20 @@
+# Node.js
+/wpp/node_modules/
+.idea/*
+# Python
+.venv/
+
+# Ambiente
+.env
+*.log
+
+.idea/vcs.xml
+server/__pycache__/main.cpython-312.pyc
+# Build/IDE
+dist/
+build/
+.idea/
+
+# Ignorar arquivos específicos
+/wpp/.wwebjs_cache/
+/wpp/.wwebjs_auth/
