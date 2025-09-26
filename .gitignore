@@ -15,8 +15,11 @@ dist/
 build/
 .idea/
 
+
 # Ignorar arquivos específicos
 /main/.wwebjs_cache/
 /main/.wwebjs_auth/
 /main/package-lock.json
 /main/package.json
+tailscale/
+main/auth

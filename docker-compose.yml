@@ -1,0 +1,32 @@
+services:
+  bot:
+    build:
+      context: ./main
+      dockerfile: Dockerfile
+    container_name: rq-assistente-bot
+    volumes:
+      - ./main:/app
+      - ./db:/app/db
+    env_file:
+      - .env
+    ports:
+      - "3000:3000" # Porta para testes locais, ajuste se necessário
+    depends_on:
+      - tailscale
+    restart: unless-stopped
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: rq-assistente-tailscale
+    volumes:
+      - ./tailscale:/var/lib/tailscale
+    environment:
+      - TAILSCALE_AUTHKEY=${TAILSCALE_AUTHKEY}
+      - TAILSCALE_HOSTNAME=rq-assistente-bot
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped
+
+volumes:
+  tailscale:

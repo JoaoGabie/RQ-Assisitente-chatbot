@@ -1,315 +1,218 @@
-// ====== Imports e setup ======
-const { Client, LocalAuth } = require('whatsapp-web.js');
+
+
+const path = require('path');
+const fs = require('fs');
 const qrcode = require('qrcode-terminal');
-const axios   = require('axios');
-const fs      = require('fs');
-const path    = require('path');
+const pino = require('pino');
+const dotenv = require('dotenv');
+// main/index.js
 
-const SERVER = 'http://127.0.0.1:8000';
-const ALLOWED_CHAT = null; // se quiser restringir a um chat ID
-const MEDIA_DIR = path.join(__dirname, '..', 'media');
-if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
+const ENV_PATH = path.join(__dirname, '..', '.env');
 
-const client = new Client({ authStrategy: new LocalAuth() });
+if (fs.existsSync(ENV_PATH)) {
+  dotenv.config({ path: ENV_PATH });
+  console.log('🔧 .env carregado de', ENV_PATH);
+} else {
+  console.warn('⚠️ .env NÃO encontrado em', ENV_PATH);
+}
 
-// ====== Flags/Helpers ======
-const REQUIRE_PREFIX_IN_GROUP = true;               // Em grupo só responde quando mencionado
-const DM_HELP_COOLDOWN_MS     = 12 * 60 * 60 * 1000;
-const dmHelpMemory = new Map();                     // userId -> timestamp
-const pending = new Map();                          // chatId -> [results]
-let MY_WID = null;                                  // id do próprio bot (wid serializado)
+// Agora sim: debug das variáveis JÁ carregadas
+console.log('🔎 Variáveis carregadas:');
+console.log('OPENROUTER_API_KEY:', process.env.OPENROUTER_API_KEY ? process.env.OPENROUTER_API_KEY.slice(0, 10) + '...' : 'MISSING');
+console.log('OPENROUTER_MODEL:', process.env.OPENROUTER_MODEL || 'MISSING');
+console.log('LOG_LEVEL:', process.env.LOG_LEVEL || 'MISSING');
+console.log('PORT:', process.env.PORT || 'MISSING');
 
-// ====== Eventos básicos ======
-client.on('qr', (qr) => {
-  qrcode.generate(qr, { small: true });
-  console.log('📱 Escaneia o QR pra logar no WhatsApp Web');
+dotenv.config();
+if (!process.env.OPENROUTER_API_KEY) {
+  const rootEnv = path.join(__dirname, '..', '.env');
+  if (fs.existsSync(rootEnv)) {
+    dotenv.config({ path: rootEnv });
+    console.log('🔧 .env carregado de', rootEnv);
+  }
+}
+
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  useMultiFileAuthState,
+  Browsers,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+
+const MODULES_DIR = path.join(__dirname, 'modules');
+const modules = {};
+
+// ----- Logger (pino + pino-pretty) -----
+const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
+const logger = pino({
+  level: LOG_LEVEL,
+  transport: {
+    target: 'pino-pretty',
+    options: {
+      colorize: true,
+      translateTime: 'SYS:yyyy-mm-dd HH:MM:ss',
+      ignore: 'pid,hostname',
+      singleLine: false,
+      messageKey: 'msg',
+    },
+  },
 });
-client.on('authenticated', () => console.log('🔐 Authenticated'));
-client.on('ready', () => {
-  console.log('✅ Client ready');
-  try {
-    // Ex.: '557199999999@c.us'
-    MY_WID = client.info?.wid?._serialized || null;
-    console.log('🤖 My WID:', MY_WID);
-  } catch (e) {
-    console.log('⚠️ Não consegui ler MY_WID:', e);
-  }
-});
-client.on('auth_failure', m => console.log('❌ Auth failure:', m));
-client.on('disconnected', r => console.log('🔌 Disconnected:', r));
-client.on('change_state', s => console.log('🔄 State:', s));
-client.on('loading_screen', (p,msg) => console.log('⏳ Loading:', p, msg||''));
 
-// ====== Utils ======
-function isUrl(s){ return /^https?:\/\//i.test(s || ''); }
-function isLocalId(s){ s=(s||'').trim(); return /^#?\d{1,4}$/.test(s) || /^[A-Za-z]\d{3,}$/.test(s); }
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let restarting = false;
 
-// Parser “natural” para DM (sem @bot)
-function parseDmIntent(text) {
-  const m = (text || '').trim();
-  if (!m) return null;
+const startBot = async () => {
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  logger.info(`WA version: ${version.join('.')} ${isLatest ? '(latest)' : ''}`);
 
-  const vol = m.match(/\bvolume\s+(\d{1,3})\b/i);
-  if (vol) return { name: 'volume', rest: vol[1] };
+  const { state, saveCreds } = await useMultiFileAuthState(path.join(__dirname, 'auth'));
 
-  if (/^(play|tocar|soltar)\b/i.test(m)) {
-    const rest = m.replace(/^(play|tocar|soltar)\b/i, '').trim();
-    return { name: 'tocar', rest };
-  }
+  const sock = makeWASocket({
+    version,
+    auth: state,
+    browser: Browsers.ubuntu('Chrome'),
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    emitOwnEvents: false,
+    connectTimeoutMs: 30_000,
+    logger,
+  });
 
-  if (/^(pause|pausar|parar)\b/i.test(m)) return { name: 'pause', rest: '' };
-  if (/^(pular|next|próxima|proxima)\b/i.test(m)) return { name: 'pular',  rest: '' };
-  if (/^(fila|queue)\b/i.test(m))               return { name: 'fila',   rest: '' };
-  if (/^(limpar|clear)\b/i.test(m))             return { name: 'limpar', rest: '' };
-  if (/^(ajuda|help)\b/i.test(m))               return { name: 'ajuda',  rest: '' };
-  if (/^rotulo\s+/i.test(m)) {
-    const [_, ...tail] = m.split(/\s+/);
-    return { name: 'rotulo', rest: tail.join(' ') };
-  }
+  sock.ev.on('creds.update', saveCreds);
 
-  if (isUrl(m)) return { name: 'tocar', rest: m }; // URL direta
-  return null;
-}
+  // Conexão + QR
+  sock.ev.on('connection.update', async (update) => {
+    const { qr, connection, lastDisconnect } = update;
 
-// Grupo: detectar menção real ao bot
-async function isBotMentioned(msg) {
-  try {
-    if (!MY_WID) return false;
-    const mentions = await msg.getMentions(); // array Contacts
-    return mentions.some(c => (c.id?._serialized) === MY_WID);
-  } catch (e) {
-    console.log('⚠️ getMentions falhou:', e);
-    return false;
-  }
-}
-
-// Remove menções no início da mensagem (ex.: "@Fulano @Bot comando ...")
-function stripLeadingMentions(body) {
-  let m = (body || '').trim();
-  return m.replace(/^(@\S+\s*)+/, '').trim();
-}
-
-// ====== Listener principal ======
-client.on('message', async msg => {
-  try {
-    console.log(`📩 De ${msg.from}: "${msg.body}"`);
-
-    if (ALLOWED_CHAT && msg.from !== ALLOWED_CHAT) {
-      console.log(`🚫 Ignorado (chat não autorizado: ${msg.from})`);
-      return;
+    if (qr) {
+      console.clear();
+      logger.info('📱 Escaneie o QR abaixo para conectar:');
+      qrcode.generate(qr, { small: true });
     }
 
-    const chat = await msg.getChat();
-    const isGroup = chat.isGroup;
-
-    // ===== Upload de mídia (áudio) =====
-    // DM: aceita sem menção | Grupo: só se mencionar o bot
-    if (msg.hasMedia) {
-      const proceed = !isGroup || (isGroup && await isBotMentioned(msg));
-      if (proceed) {
-        console.log('📥 Recebido arquivo de mídia');
-        const media = await msg.downloadMedia();
-        const ext = (media.mimetype.split('/')[1] || '').toLowerCase();
-        if (!/^(mp3|wav|flac|aac|ogg|m4a)$/.test(ext)) {
-          await msg.reply('❌ Só aceito arquivos de áudio (mp3, wav, flac, aac, ogg, m4a).');
-          return;
-        }
-        const id = 'A' + Date.now().toString().slice(-6);
-        const file = path.join(MEDIA_DIR, `${id}.${ext}`);
-        fs.writeFileSync(file, Buffer.from(media.data, 'base64'));
-        console.log(`💾 Arquivo salvo: ${file} (ID ${id})`);
-        await axios.post(`${SERVER}/library/import`, { id, file, label: null });
-        await msg.reply(
-          `📥 áudio recebido (${ext}). ID: ${id}\n` +
-          `Defina rótulo: rotulo ${id} <texto>\n` +
-          `Tocar: tocar ${id}`
-        );
-        return;
+    if (connection === 'open') {
+      logger.info('✅ Conexão estabelecida com o WhatsApp!');
+      logger.info({ user: sock.user }, '👤 Usuário conectado');
+      try {
+        await sock.sendMessage(sock.user.id, { text: 'RQ Assistente online ✅' });
+      } catch (e) {
+        logger.warn({ err: e?.message }, 'Falha ao enviar ping inicial');
       }
     }
 
-    // ===== Seleção por número / sair (precisa vir ANTES do parsing) =====
-    {
-      const raw = (msg.body || '').trim();
-      const isNumberOnly = /^\d+$/.test(raw);
-      const isExit       = /^sair$/i.test(raw);
+    if (connection === 'close') {
+      const boom = lastDisconnect?.error;
+      const statusCode =
+        boom?.output?.statusCode ??
+        boom?.output?.payload?.statusCode ??
+        boom?.data?.statusCode ??
+        boom?.statusCode ??
+        'unknown';
 
-      if (pending.has(msg.from) && (isNumberOnly || isExit)) {
-        const list = pending.get(msg.from);
+      logger.warn({ statusCode }, '🔌 Conexão fechada');
 
-        if (isExit) {
-          pending.delete(msg.from);
-          await msg.reply('✅ Pesquisa cancelada.\nDica: use *tocar <link do YouTube>* para tocar um link direto.');
-          return;
+      if (statusCode !== DisconnectReason.loggedOut) {
+        if (!restarting) {
+          restarting = true;
+          const waitMs = 2000;
+          logger.info(`♻️ Tentando reconectar em ${waitMs} ms...`);
+          await sleep(waitMs);
+          restarting = false;
+          startBot().catch((e) => logger.error({ err: e?.message }, 'Erro ao reiniciar'));
         }
+      } else {
+        logger.error('🚪 Sessão deslogada. Exclua a pasta "auth" e pareie novamente.');
+      }
+    }
+  });
 
-        const idx = parseInt(raw, 10) - 1;
-        if (isNaN(idx) || idx < 0 || idx >= list.length) {
-          await msg.reply('Índice inválido. Digite um número da lista ou *sair* para cancelar.');
-          return;
+  // ----- Carregar módulos -----
+  try {
+    // 1) carrega PUBLIC primeiro (prioridade)
+    const publicPath = path.join(MODULES_DIR, 'public.js');
+    if (fs.existsSync(publicPath)) {
+      delete require.cache[publicPath];
+      const publicMod = require(publicPath);
+      if (publicMod?.onMessage) {
+        modules['public'] = publicMod;
+        logger.info({ moduleName: 'public' }, '📦 Módulo carregado com prioridade');
+      }
+    }
+
+    // 2) carrega os demais módulos
+    const files = fs.readdirSync(MODULES_DIR);
+    for (const file of files) {
+      if (!file.endsWith('.js') || file === 'public.js') continue;
+
+      const moduleName = file.replace('.js', '');
+      const modulePath = path.join(MODULES_DIR, file);
+
+      try {
+        delete require.cache[modulePath];
+        const mod = require(modulePath);
+        if (mod?.onMessage) {
+          modules[moduleName] = mod;
+          logger.info({ moduleName }, '📦 Módulo carregado');
+        } else {
+          logger.warn({ moduleName }, '⚠️ Ignorado: não exporta onMessage');
         }
+      } catch (e) {
+        logger.error({ moduleName, err: e?.message }, '💥 Falha ao carregar módulo');
+      }
+    }
+  } catch (err) {
+    logger.error({ err: err?.message }, '💥 Erro ao listar módulos');
+  }
 
-        const item = list[idx];
+  // ----- Roteamento principal -----
+  sock.ev.on('messages.upsert', async (m) => {
+    try {
+      const msg = m.messages?.[0];
+      if (!msg?.message) return;
+
+      const allowFromMe = String(process.env.ALLOW_FROM_ME || 'false').toLowerCase() === 'true';
+      if (msg.key.fromMe && !allowFromMe) return;
+
+         const jid = msg.key.remoteJid;
+        // grupos no WhatsApp terminam com "@g.us"
+        const isGroup = typeof jid === 'string' && jid.endsWith('@g.us');
+
+      // chama PUBLIC primeiro
+      if (modules['public']) {
         try {
-          await axios.post(`${SERVER}/yt/play`, { video_id: item.video_id });
-          pending.delete(msg.from);
-          await msg.reply(`▶️ ${item.title} — ${item.channel}`);
-        } catch (e) {
-          console.error('Erro ao tocar por número:', e);
-          await msg.reply('❌ Não consegui iniciar a reprodução.');
+          const handled = await modules['public'].onMessage(sock, msg, isGroup);
+          if (handled === true) return;
+        } catch (err) {
+          logger.error({ moduleName: 'public', err: err?.message }, '💥 Erro no public.onMessage');
         }
-        return;
       }
-    }
 
-    // ===== Parsing de comandos =====
-    let c = null;
-
-    if (isGroup && REQUIRE_PREFIX_IN_GROUP) {
-      // Grupo: só responde se o bot for mencionado
-      const mentioned = await isBotMentioned(msg);
-      if (!mentioned) {
-        console.log('ℹ️ Grupo: bot não foi mencionado → ignorado');
-        return;
-      }
-      // Remove menções e interpreta o primeiro token como comando
-      const cleaned = stripLeadingMentions(msg.body);
-      const parts = (cleaned || '').split(/\s+/);
-      const name = (parts.shift() || '').toLowerCase();
-      c = { name, rest: parts.join(' ') };
-      if (!c.name) {
-        await msg.reply('👋 Me mencionou? Envie um comando. Ex.: *tocar <termo>*');
-        return;
-      }
-    } else {
-      // DM: aceita sem @bot (parser natural) e também aceita @bot se usar
-      c = parseDmIntent(msg.body);
-      if (!c) {
-        const last = dmHelpMemory.get(msg.from) || 0;
-        const now  = Date.now();
-        if (now - last > DM_HELP_COOLDOWN_MS) {
-          dmHelpMemory.set(msg.from, now);
-          await msg.reply(
-            "👋 Olá! Eu sou o RQ Assistente.\n" +
-            "Aqui no privado você pode falar *sem @bot*.\n\n" +
-            "Exemplos:\n" +
-            "- *tocar <link/termo/ID>*\n" +
-            "- *volume 50*\n" +
-            "- *pular* | *pause* | *fila* | *limpar*\n" +
-            "- *ajuda* para ver tudo\n"
-          );
+      // chama outros módulos
+      for (const moduleName of Object.keys(modules)) {
+        if (moduleName === 'public') continue;
+        const mod = modules[moduleName];
+        if (typeof mod.onMessage === 'function') {
+          try {
+            await mod.onMessage(sock, msg, isGroup);
+          } catch (err) {
+            logger.error({ moduleName, err: err?.message }, '💥 Erro no módulo onMessage');
+          }
         }
-        return;
       }
+    } catch (err) {
+      logger.error({ err: err?.message }, '💥 Erro ao processar mensagens');
     }
+  });
 
-    console.log(`⚙️ Comando: ${c.name} | Args: ${c.rest || ''}`);
+  return sock;
+};
 
-    // ===== Execução =====
-    if (c.name === 'ajuda' || c.name === 'help') {
-      return msg.reply(
-        `📖 *Comandos:*\n` +
-        `tocar <url|#id|texto>\n` +
-        `Após a busca: *digite o número* (1–5) ou *sair*\n` +
-        `soltar (ou play/pause)\n` +
-        `pular\n` +
-        `volume <0-100>\n` +
-        `fila\n` +
-        `limpar\n` +
-        `rotulo <ID> <texto>`
-      );
-    }
-
-    if (c.name === 'rotulo') {
-      const [code, ...rest] = (c.rest || '').split(/\s+/);
-      const label = (rest.join(' ') || '').trim();
-      if (!code || !label) return msg.reply('Use: rotulo <ID> <rótulo>');
-      await axios.post(`${SERVER}/library/label`, null, { params: { code, label }});
-      return msg.reply(`✅ rótulo de ${code} atualizado`);
-    }
-
-    if (c.name === 'tocar' && c.rest) {
-      const q = c.rest.trim();
-
-      if (isUrl(q)) {
-        const r = await axios.post(`${SERVER}/queue`, { query: q, requested_by: msg.author || msg.from });
-        if (!r.data.ok) return msg.reply('❌ não consegui tocar (confirmação requerida).');
-        return msg.reply('▶️ streaming...');
-      }
-
-      if (isLocalId(q)) {
-        const s = await axios.post(`${SERVER}/library/search`, { query: q, limit: 1 });
-        if (!s.data.results.length) return msg.reply('ID não encontrado.');
-        await axios.post(`${SERVER}/queue/by-id`, { db_id: s.data.results[0].db_id });
-        return msg.reply(`▶️ ${s.data.results[0].title}`);
-      }
-
-      // Aviso de latência antes da busca
-      await msg.reply('🔎 Pesquisando no YouTube…');
-
-      const find = await axios.post(`${SERVER}/yt/search`, { query: q, limit: 5 });
-      if (!find.data.ok || !find.data.results.length) {
-        return msg.reply(
-          '❌ Nada encontrado.\n' +
-          'Dica: envie *tocar <link do YouTube>* para tocar um link direto.'
-        );
-      }
-
-      pending.set(msg.from, find.data.results);
-      const linhas = find.data.results
-        .map((x,i)=>`${i+1}. ${x.title} — ${x.channel} [${x.duration}]`)
-        .join('\n');
-
-      return msg.reply(
-        `Encontrei:\n${linhas}\n\n` +
-        `*Digite apenas o número* da música desejada.\n` +
-        `Se não encontrou, digite *sair*.\n` +
-        `Dica: use *tocar <link do YouTube>* para tocar um link direto.`
-      );
-    }
-
-    if (['soltar','play','pause'].includes(c.name)) {
-      await axios.post(`${SERVER}/play`);
-      return msg.reply('⏯️ play/pause');
-    }
-
-    if (c.name === 'pular' || c.name === 'next') {
-      await axios.post(`${SERVER}/next`);
-      return msg.reply('⏭️ próxima');
-    }
-
-    if (c.name === 'volume') {
-      const v = parseInt((c.rest||''),10);
-      if (isNaN(v)) return msg.reply('Use: volume 0-100');
-      // mantém POST com params, como no teu backend
-      await axios.post(`${SERVER}/volume`, null, { params:{ value:v } });
-      return msg.reply(`🔊 volume ${v}%`);
-    }
-
-    if (c.name === 'fila') {
-      const r = await axios.get(`${SERVER}/queue`);
-      const linhas = (r.data.playlist||[])
-        .map(it => `${it.current?'▶️':'•'} ${it.index}. ${it.filename}`)
-        .slice(0,10)
-        .join('\n');
-      return msg.reply(linhas || 'fila vazia');
-    }
-
-    if (c.name === 'limpar') {
-      await axios.post(`${SERVER}/queue/clear`);
-      return msg.reply('🧹 fila limpa');
-    }
-
-    // Fallback
-    await msg.reply(
-      `Comandos: tocar <url|#id|texto> | após a busca *número* (1–5) ou *sair* | ` +
-      `soltar | pular | volume <0-100> | fila | limpar | rotulo <ID> <texto>`
-    );
-
-  } catch (e) {
-    console.error('💥 Erro ao processar comando:', e);
-    try { await msg.reply('❌ erro ao processar comando'); } catch {}
-  }
+process.on('unhandledRejection', (reason) => {
+  logger.error({ reason }, 'unhandledRejection');
+});
+process.on('uncaughtException', (err) => {
+  logger.error({ err: err?.message, stack: err?.stack }, 'uncaughtException');
 });
 
-client.initialize();
+startBot().catch((err) => logger.error({ err: err?.message }, '💥 Erro fatal ao iniciar o bot'));
