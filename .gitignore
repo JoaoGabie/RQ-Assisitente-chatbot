@@ -1,5 +1,5 @@
 # Node.js
-/wpp/node_modules/
+/main/node_modules/
 .idea/*
 # Python
 .venv/
@@ -16,5 +16,7 @@ build/
 .idea/
 
 # Ignorar arquivos específicos
-/wpp/.wwebjs_cache/
-/wpp/.wwebjs_auth/
+/main/.wwebjs_cache/
+/main/.wwebjs_auth/
+/main/package-lock.json
+/main/package.json
